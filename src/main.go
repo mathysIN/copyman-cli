@@ -30,10 +30,15 @@ type Config struct {
 	Token string
 }
 
+type SessionData struct {
+	SessionID string
+	Password  string
+}
+
 type Command string
 
 const (
-	NONE   Command = "none"
+	NONE    Command = "none"
 	LOGIN   Command = "login"
 	LOGOUT  Command = "logout"
 	CONTENT Command = "content"
@@ -54,20 +59,24 @@ func getJSON(url string, target interface{}) error {
 	return json.Unmarshal(body, target)
 }
 
-func postJSON(url string, target interface{}, note string) (*http.Response, error) {
+func join(sessionId string) (*http.Response, error) {
+	
+}
 
+func createNote(data SessionData, note string) (*http.Response, error) {
+	url := "https://copyman.fr/api/notes"
 	body := []byte(`{
 		"content":"` + note + `"
 	}`)
 
 	sessionCookie := &http.Cookie{
 		Name:  "session",
-		Value: "mathys",
+		Value: data.SessionID,
 	}
 
 	passwordCookie := &http.Cookie{
 		Name:  "password",
-		Value: "b712010b801c6d2265fe3d6b05911c660946476fc3185be8f14be503cf45b5d27f6c33baa6a8ceca4f7c4b49bf54c0cf8046c0e8153fcff71edf5afa9e66b3cd",
+		Value: data.Password,
 	}
 
 	r, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
