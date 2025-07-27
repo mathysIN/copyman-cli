@@ -428,14 +428,18 @@ func truncate(s string, maxLength int) string {
 	return s
 }
 
-func downloadFile(url string) error {
+func downloadFile(url string, defaultFileName string) error {
 	prompt := promptui.Prompt{
-		Label: "Enter file save location",
+		Label: "Enter file save location (default: " + defaultFileName + ")",
 	}
 
 	filename, err := prompt.Run()
 	if err != nil {
 		return err
+	}
+
+	if filename == "" {
+		filename = defaultFileName
 	}
 
 	resp, err := http.Get(url)
@@ -605,7 +609,7 @@ func main() {
 			fmt.Println(c.Content)
 		case AttachmentType:
 			fmt.Println(c.AttachmentURL)
-			err := downloadFile(c.AttachmentURL)
+			err := downloadFile(c.AttachmentURL, c.AttachmentPath)
 			if err != nil {
 				fmt.Println("Download failed", err)
 				return
