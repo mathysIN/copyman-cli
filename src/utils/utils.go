@@ -1,8 +1,8 @@
 package utils
 
 const (
-	SITE_LINK           = "https://localhost:3000"
-	API_LINK            = "https://localhost:3000/api"
+	SITE_LINK           = "https://copyman.fr"
+	API_LINK            = "https://copyman.fr/api"
 	API_PATH_SESSION    = "/sessions"
 	API_PATH_NOTE       = "/notes"
 	API_PATH_CONTENT    = "/content"

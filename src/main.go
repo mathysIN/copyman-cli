@@ -1,16 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -18,38 +19,9 @@ import (
 	"time"
 
 	"github.com/manifoldco/promptui"
-
-	socketio_v5 "github.com/maldikhan/go.socket.io"
-	socketio_v5_client "github.com/maldikhan/go.socket.io/socket.io/v5/client"
 	"github.com/mathysin/copyman-cli/utils"
 	"golang.org/x/term"
 )
-
-func main2() {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	clientSocket, err := socketio_v5.NewClient(
-		socketio_client_v5.WithRawURL(utils.SITE_LINK),
-	)
-	if err != nil {
-		log.Fatalf("Error creating client: %v", err)
-	}
-
-	clientSocket.On("eventname", func(data []byte) {
-		fmt.Printf("Received message: %s\n", string(data))
-	})
-
-	if err := clientSocket.Connect(ctx); err != nil {
-		log.Fatalf("Error connecting to server: %v", err)
-	}
-
-	if err := clientSocket.Emit("hello", "world"); err != nil {
-		log.Fatalf("Error sending message: %v", err)
-	}
-
-	<-ctx.Done()
-}
 
 const configFolderPath = "/copyman/"
 const configFolderFileName = "config"
@@ -164,10 +136,16 @@ type Command string
 
 const (
 	NONE   Command = "none"
-	LOGIN  Command = "login"
 	LOGOUT Command = "logout"
 	PUSH   Command = "push"
 	LIST   Command = "list"
+)
+
+type CommandPush string
+
+const (
+	FILE CommandPush = "file"
+	TEXT CommandPush = "text"
 )
 
 func joinSession(data Config) (GetSessionResponseBody, error) {
@@ -189,6 +167,7 @@ func joinSession(data Config) (GetSessionResponseBody, error) {
 	defer response.Body.Close()
 	var sessionCookieData GetSessionResponseBody
 	if err := json.NewDecoder(response.Body).Decode(&sessionCookieData); err != nil {
+		fmt.Println(err)
 		return GetSessionResponseBody{}, errors.New("error parsing server response")
 	}
 
@@ -229,6 +208,48 @@ func createNote(data Config, note string) (*http.Response, error) {
 	}
 
 	return response, nil
+}
+
+func uploadFile(data Config, filePath string) (*http.Response, error) {
+	url := "https://copyman.fr/api/content/upload"
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	part, err := writer.CreateFormFile("files", filepath.Base(filePath))
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err = io.Copy(part, file); err != nil {
+		return nil, err
+	}
+
+	if err = writer.Close(); err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", url, &buf)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	cookies := []*http.Cookie{
+		{Name: "session", Value: data.SessionID},
+		{Name: "password", Value: data.Password},
+	}
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+
+	return client.Do(req)
 }
 
 func getSessionContent(data Config) ([]ContentType, error) {
@@ -461,6 +482,47 @@ func downloadFile(url string, defaultFileName string) error {
 	return err
 }
 
+func login() error {
+	fmt.Println("Enter Session Id: ")
+	inputSessionId, err := term.ReadPassword(int(syscall.Stdin))
+	if err != nil {
+		return fmt.Errorf("Error reading session id", err)
+	}
+
+	fmt.Println("Enter Password: ")
+
+	inputPassword, err := term.ReadPassword(int(syscall.Stdin))
+	if err != nil {
+		return fmt.Errorf("Error reading password:", err)
+	}
+
+	joinedSession, err := joinSession(Config{SessionID: string(inputSessionId), Password: string(inputPassword)})
+	if err != nil {
+		return fmt.Errorf("Cannot join session", err)
+	}
+
+	err = writeConfig(Config{
+		SessionID: joinedSession.SessionID,
+		Password:  joinedSession.Password,
+	})
+
+	if err != nil {
+		return fmt.Errorf("Cannot write to config file:", err)
+	}
+
+	fmt.Println("Successfully joined room !")
+
+	return nil
+}
+
+func printHelp() {
+	fmt.Println("")
+	fmt.Println("Commands :")
+	fmt.Println("- " + LOGOUT)
+	fmt.Println("- " + PUSH)
+	fmt.Println("- " + LIST)
+}
+
 func main() {
 
 	err := createDefaultConfig()
@@ -476,22 +538,15 @@ func main() {
 
 	if len(os.Args) < 2 {
 		fmt.Println("Missing arguments")
-		fmt.Println("")
-		fmt.Println("Commands :")
-		fmt.Println("- " + LOGIN)
-		fmt.Println("- " + LOGOUT)
-		fmt.Println("- " + PUSH)
-		fmt.Println("- " + LIST)
+		printHelp()
 		return
 	}
 
-	contentType := os.Args[1]
+	selectedCommand := os.Args[1]
 
 	var command Command = NONE
 
-	switch strings.ToLower(contentType) {
-	case "login":
-		command = LOGIN
+	switch strings.ToLower(selectedCommand) {
 	case "list":
 		command = LIST
 	case "logout":
@@ -500,12 +555,11 @@ func main() {
 		command = PUSH
 	}
 
-	if command == NONE {
-		fmt.Println(command)
-		return
-	}
-
 	switch command {
+	case NONE:
+		fmt.Println("Unknown command")
+		printHelp()
+		return
 	case LOGOUT:
 		if config.SessionID == "" {
 			fmt.Println("You're not logged in")
@@ -515,63 +569,57 @@ func main() {
 			SessionID: "",
 			Password:  "",
 		})
-		fmt.Println("Logged out")
-		return
-	case LOGIN:
-		if len(os.Args) < 3 {
-			fmt.Println("login <sessionId>")
-			return
-		}
-
-		inputSessionId := os.Args[2]
-
-		fmt.Print("Enter Password: ")
-
-		inputPassword, err := term.ReadPassword(int(syscall.Stdin))
-		if err != nil {
-			fmt.Println("Error reading password:", err)
-			return
-		}
-
-		joinedSession, err := joinSession(Config{SessionID: inputSessionId, Password: string(inputPassword)})
-		if err != nil {
-			fmt.Println("Cannot join session", err)
-			return
-		}
-
-		err = writeConfig(Config{
-			SessionID: inputSessionId,
-			Password:  joinedSession.Password,
-		})
-
-		if err != nil {
-			fmt.Println("Cannot write to config file:", err)
-			return
-		}
-
-		fmt.Println("Successfully joined room !")
-
+		fmt.Println("Successfully logged out")
 		return
 
 	case PUSH:
 		if config.SessionID == "" {
-			fmt.Println("Please login before upload content")
+			err = login()
+			if err != nil {
+				fmt.Println("Error:", err)
+				return
+			}
+		}
+
+		text := strings.Join(os.Args[2:], " ")
+		filePath := strings.Join(os.Args[2:], "")
+		if len(text) == 0 {
+			fmt.Println("Please provide text content or a file path")
 			return
 		}
 
-		content := os.Args[2:]
-		_, err := createNote(config, strings.Join(content, " "))
-		if err != nil {
-			fmt.Println("Error:", err)
-			return
+		choice := ""
+		reader := bufio.NewReader(os.Stdin)
+		for choice != "t" && choice != "f" {
+			fmt.Println("Upload text or file? (t/f): ")
+			choice, _ = reader.ReadString('\n')
+			choice = strings.TrimSpace(choice)
 		}
 
-		fmt.Println("Successfully pushed note to your session")
+		if choice == "t" {
+			_, err := createNote(config, text)
+			if err != nil {
+				fmt.Println("Error:", err)
+				return
+			}
+
+			fmt.Println("Successfully pushed note to your session")
+		} else if choice == "f" {
+			_, err := uploadFile(config, filePath)
+			if err != nil {
+				fmt.Println("Error:", err)
+				return
+			}
+		}
+		return
 
 	case LIST:
 		if config.SessionID == "" {
-			fmt.Println("Please login before upload content")
-			return
+			err = login()
+			if err != nil {
+				fmt.Println("Error:", err)
+				return
+			}
 		}
 		sessionContent, err := getSessionContent(config)
 		if err != nil {
@@ -614,9 +662,7 @@ func main() {
 				fmt.Println("Download failed", err)
 				return
 			}
-		default:
 		}
-
 	}
 
 }
