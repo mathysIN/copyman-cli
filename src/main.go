@@ -136,6 +136,7 @@ type Command string
 
 const (
 	NONE   Command = "none"
+	LOGIN  Command = "login"
 	LOGOUT Command = "logout"
 	PUSH   Command = "push"
 	LIST   Command = "list"
@@ -196,10 +197,6 @@ func createNote(data Config, note string) (*http.Response, error) {
 
 	for _, cookie := range cookies {
 		r.AddCookie(cookie)
-	}
-
-	if err != nil {
-		return nil, err
 	}
 
 	response, err := client.Do(r)
@@ -451,7 +448,8 @@ func truncate(s string, maxLength int) string {
 
 func downloadFile(url string, defaultFileName string) error {
 	prompt := promptui.Prompt{
-		Label: "Enter file save location (default: " + defaultFileName + ")",
+		Default: defaultFileName,
+		Label:   "Enter file save location",
 	}
 
 	filename, err := prompt.Run()
@@ -460,7 +458,7 @@ func downloadFile(url string, defaultFileName string) error {
 	}
 
 	if filename == "" {
-		filename = defaultFileName
+		return errors.New("Download cancelled")
 	}
 
 	resp, err := http.Get(url)
@@ -482,7 +480,7 @@ func downloadFile(url string, defaultFileName string) error {
 	return err
 }
 
-func login() error {
+func promptLogin() error {
 	fmt.Println("Enter Session Id: ")
 	inputSessionId, err := term.ReadPassword(int(syscall.Stdin))
 	if err != nil {
@@ -518,13 +516,13 @@ func login() error {
 func printHelp() {
 	fmt.Println("")
 	fmt.Println("Commands :")
-	fmt.Println("- " + LOGOUT)
-	fmt.Println("- " + PUSH)
-	fmt.Println("- " + LIST)
+	fmt.Println("- " + LOGIN + " : login to a session")
+	fmt.Println("- " + PUSH + " : upload text or file to session")
+	fmt.Println("- " + LIST + " : list element on session")
+	fmt.Println("- " + LOGOUT + " : disconnect from session")
 }
 
 func main() {
-
 	err := createDefaultConfig()
 	if err != nil {
 		fmt.Println("Cannot create config file:", err)
@@ -549,6 +547,8 @@ func main() {
 	switch strings.ToLower(selectedCommand) {
 	case "list":
 		command = LIST
+	case "login":
+		command = LOGIN
 	case "logout":
 		command = LOGOUT
 	case "push":
@@ -559,6 +559,9 @@ func main() {
 	case NONE:
 		fmt.Println("Unknown command")
 		printHelp()
+		return
+	case LOGIN:
+		promptLogin()
 		return
 	case LOGOUT:
 		if config.SessionID == "" {
@@ -574,7 +577,7 @@ func main() {
 
 	case PUSH:
 		if config.SessionID == "" {
-			err = login()
+			err = promptLogin()
 			if err != nil {
 				fmt.Println("Error:", err)
 				return
@@ -582,7 +585,7 @@ func main() {
 		}
 
 		text := strings.Join(os.Args[2:], " ")
-		filePath := strings.Join(os.Args[2:], "")
+		filePaths := os.Args[2:]
 		if len(text) == 0 {
 			fmt.Println("Please provide text content or a file path")
 			return
@@ -602,20 +605,21 @@ func main() {
 				fmt.Println("Error:", err)
 				return
 			}
-
-			fmt.Println("Successfully pushed note to your session")
 		} else if choice == "f" {
-			_, err := uploadFile(config, filePath)
-			if err != nil {
-				fmt.Println("Error:", err)
-				return
+			for _, filePath := range filePaths {
+				_, err := uploadFile(config, filePath)
+				if err != nil {
+					fmt.Println("Error:", err)
+					return
+				}
 			}
 		}
+		fmt.Println("Successfully pushed content to your session")
 		return
 
 	case LIST:
 		if config.SessionID == "" {
-			err = login()
+			err = promptLogin()
 			if err != nil {
 				fmt.Println("Error:", err)
 				return
@@ -630,11 +634,10 @@ func main() {
 		for _, content := range sessionContent {
 			switch c := content.(type) {
 			case NoteType:
-				options = append(options, "[✎] "+truncate(c.Content, 30))
+				options = append(options, "[T] "+truncate(c.Content, 30))
 			case AttachmentType:
-				options = append(options, "[⛓] "+c.AttachmentPath)
+				options = append(options, "[#] "+c.AttachmentPath)
 			default:
-				options = append(options, "[?] Unknown Type")
 			}
 		}
 
