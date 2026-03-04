@@ -906,6 +906,13 @@ Commands:
             copyman encryption enable --password <pass>
             copyman encryption disable
 
+  update    Check for updates and self-update
+            copyman update
+
+  version   Show version information
+            copyman version
+            copyman --version
+
 Options:
   --session-id    Session ID (custom or to join)
   --password      Password for session
@@ -1398,6 +1405,10 @@ func main() {
 		err = runStatus()
 	case "encryption":
 		err = runEncryption(args)
+	case "update":
+		err = runUpdate(args)
+	case "version", "--version", "-v":
+		runVersion()
 	case "help", "-h", "--help":
 		printHelp()
 	default:
