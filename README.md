@@ -4,16 +4,24 @@ A command-line interface for [copyman.fr](https://copyman.fr) - share notes and 
 
 ## Features
 
-- 📋 **Share notes** - Quick text sharing across devices
-- 📁 **Share files** - Upload and download files
-- 🔐 **End-to-End Encryption** - Optional E2EE for sensitive content
-- 🌐 **Cross-platform** - Works on Linux, macOS, and Windows
-- 🚀 **Fast** - Lightweight Go binary
-- 🖥️ **Interactive** - Arrow-key selection with `-i` flag
+- **Share notes** - Quick text sharing across devices
+- **Share files** - Upload and download files
+- **End-to-End Encryption** - Optional E2EE for sensitive content
+- **Cross-platform** - Works on Linux, macOS, and Windows
+- **Fast** - Lightweight Go binary
+- **Interactive** - Arrow-key selection with `-i` flag
 
 ## Installation
 
-### Option 1: Download Binary (Recommended)
+### Quick Install (Recommended)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/mathysIN/copyman-cli/main/install.sh | bash
+```
+
+This installs to `/usr/local/bin/copyman`. You may need to run with `sudo` depending on your system permissions.
+
+### Option 2: Download Binary
 
 Download the latest release for your platform from the [Releases page](https://github.com/mathysin/copyman-cli/releases).
 
@@ -26,13 +34,13 @@ sudo mv copyman-linux-amd64 /usr/local/bin/copyman
 # Add copyman-windows-amd64.exe to your PATH
 ```
 
-### Option 2: Go Install
+### Option 3: Go Install
 
 ```bash
 go install github.com/mathysin/copyman-cli/src@latest
 ```
 
-### Option 3: Build from Source
+### Option 4: Build from Source
 
 ```bash
 git clone https://github.com/mathysin/copyman-cli.git
@@ -43,7 +51,7 @@ make build
 
 ## Updating
 
-### Self-Update (Recommended)
+### Self-Update
 
 ```bash
 # Check for updates and update automatically
@@ -124,7 +132,7 @@ copyman delete <content-id>
 
 ### End-to-End Encryption
 
-E2EE is **optional** and separate from session passwords:
+E2EE is optional and separate from session passwords:
 
 ```bash
 # 1. Create session with password (access control)
