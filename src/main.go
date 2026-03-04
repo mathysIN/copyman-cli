@@ -17,7 +17,9 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/manifoldco/promptui"
 	"github.com/mathysin/copyman-cli/utils"
 )
 
@@ -28,9 +30,6 @@ var jar, _ = cookiejar.New(nil)
 
 var client = http.Client{
 	Jar: jar,
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
 }
 
 type GetSessionResponseBody struct {
@@ -39,6 +38,16 @@ type GetSessionResponseBody struct {
 	CreateNewSession bool   `json:"createNewSession"`
 	HasPassword      bool   `json:"hasPassword"`
 	IsValidPassword  bool   `json:"isValidPassword"`
+	CreatedAt        string `json:"createdAt"`
+	SessionToken     string `json:"sessionToken"`
+}
+
+type SessionCheckResponse struct {
+	Valid            bool   `json:"valid"`
+	HasPassword      bool   `json:"hasPassword"`
+	IsEncrypted      bool   `json:"isEncrypted"`
+	CreateNewSession bool   `json:"createNewSession"`
+	CreatedAt        string `json:"createdAt"`
 }
 
 type PostNoteRequestBody struct {
@@ -51,8 +60,9 @@ type KeyValue struct {
 }
 
 type Config struct {
-	SessionID string
-	Password  string
+	SessionID    string
+	SessionToken string
+	CreatedAt    string
 }
 
 type BaseContentType struct {
@@ -131,23 +141,39 @@ func (a AttachmentType) GetID() string {
 func createSession(sessionID string, password string, temporary bool) (Config, error) {
 	apiURL := utils.API_LINK + utils.API_PATH_SESSION
 
-	formData := url.Values{}
-	if !temporary {
-		formData.Set("session", strings.ToLower(sessionID))
-	}
-	if password != "" {
-		formData.Set("password", password)
-	}
-	if temporary {
-		formData.Set("temporary", "true")
+	// Generate timestamp for key derivation (consistent with web app)
+	createdAt := fmt.Sprintf("%d", getTimestamp())
+
+	// Prepare request body
+	requestBody := map[string]interface{}{
+		"session":   strings.ToLower(sessionID),
+		"createdAt": createdAt,
+		"join":      false,
 	}
 
-	request, err := http.NewRequest("POST", apiURL, strings.NewReader(formData.Encode()))
+	if temporary {
+		requestBody["temporary"] = true
+		// For temporary sessions, don't send session ID (server generates it)
+		delete(requestBody, "session")
+	}
+
+	// Derive authKey from password if provided
+	if password != "" {
+		authKey := deriveAuthKey(password, createdAt)
+		requestBody["authKey"] = authKey
+	}
+
+	jsonBody, err := json.Marshal(requestBody)
 	if err != nil {
 		return Config{}, err
 	}
 
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return Config{}, err
+	}
+
+	request.Header.Set("Content-Type", "application/json")
 
 	response, err := client.Do(request)
 	if err != nil {
@@ -155,26 +181,27 @@ func createSession(sessionID string, password string, temporary bool) (Config, e
 	}
 	defer response.Body.Close()
 
-	body, _ := io.ReadAll(response.Body)
+	// Check cookies from the jar (they may have been set on redirect responses)
+	parsedURL, _ := url.Parse(apiURL)
+	cookies := jar.Cookies(parsedURL)
 
-	var result struct {
-		Success bool   `json:"success"`
-		Error   string `json:"error"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return Config{}, fmt.Errorf("error parsing response: %w (body: %s)", err, string(body))
-	}
-
-	if !result.Success {
-		return Config{}, fmt.Errorf("failed to create session: %s", result.Error)
-	}
-
-	cookies := response.Cookies()
-	var sessionCookie *http.Cookie
+	var sessionCookie, sessionTokenCookie *http.Cookie
 	for _, c := range cookies {
 		if c.Name == "session" {
 			sessionCookie = c
-			break
+		} else if c.Name == "session_token" {
+			sessionTokenCookie = c
+		}
+	}
+
+	// If not in jar, try response directly (for non-redirect case)
+	if sessionCookie == nil {
+		for _, c := range response.Cookies() {
+			if c.Name == "session" {
+				sessionCookie = c
+			} else if c.Name == "session_token" {
+				sessionTokenCookie = c
+			}
 		}
 	}
 
@@ -183,56 +210,136 @@ func createSession(sessionID string, password string, temporary bool) (Config, e
 	}
 
 	actualSessionID := sessionCookie.Value
-	hashedPassword := password
+	var sessionToken string
+	if sessionTokenCookie != nil {
+		sessionToken = sessionTokenCookie.Value
+	}
 
-	var passwordCookie *http.Cookie
+	return Config{
+		SessionID:    actualSessionID,
+		SessionToken: sessionToken,
+		CreatedAt:    createdAt,
+	}, nil
+}
+
+// getTimestamp returns current timestamp in milliseconds (consistent with web app)
+func getTimestamp() int64 {
+	return time.Now().UnixMilli()
+}
+
+func joinSession(data Config, password string) (GetSessionResponseBody, error) {
+	// Step 1: Check if session exists and get createdAt
+	checkURL := fmt.Sprintf("%s%s?sessionId=%s", utils.API_LINK, utils.API_PATH_SESSION, data.SessionID)
+	checkReq, err := http.NewRequest("GET", checkURL, nil)
+	if err != nil {
+		return GetSessionResponseBody{}, err
+	}
+
+	checkResp, err := client.Do(checkReq)
+	if err != nil {
+		return GetSessionResponseBody{}, err
+	}
+	defer checkResp.Body.Close()
+
+	var checkData SessionCheckResponse
+	if err := json.NewDecoder(checkResp.Body).Decode(&checkData); err != nil {
+		return GetSessionResponseBody{}, fmt.Errorf("error parsing check response: %w", err)
+	}
+
+	if checkData.CreateNewSession {
+		return GetSessionResponseBody{}, errors.New("session does not exist")
+	}
+
+	// Step 2: Derive authKey and join session
+	requestBody := map[string]interface{}{
+		"session": data.SessionID,
+		"join":    true,
+	}
+
+	if checkData.HasPassword {
+		if password == "" {
+			return GetSessionResponseBody{}, errors.New("password required for this session")
+		}
+		authKey := deriveAuthKey(password, checkData.CreatedAt)
+		requestBody["authKey"] = authKey
+	}
+
+	jsonBody, err := json.Marshal(requestBody)
+	if err != nil {
+		return GetSessionResponseBody{}, err
+	}
+
+	joinURL := utils.API_LINK + utils.API_PATH_SESSION
+	joinReq, err := http.NewRequest("POST", joinURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return GetSessionResponseBody{}, err
+	}
+
+	joinReq.Header.Set("Content-Type", "application/json")
+	joinResp, err := client.Do(joinReq)
+	if err != nil {
+		return GetSessionResponseBody{}, err
+	}
+	defer joinResp.Body.Close()
+
+	// Check if we got the session cookie (success) or an error
+	parsedURL, _ := url.Parse(joinURL)
+	cookies := jar.Cookies(parsedURL)
+
+	var hasSessionCookie bool
 	for _, c := range cookies {
-		if c.Name == "password" {
-			passwordCookie = c
+		if c.Name == "session" && c.Value == data.SessionID {
+			hasSessionCookie = true
 			break
 		}
 	}
-	if passwordCookie != nil {
-		hashedPassword = passwordCookie.Value
+
+	// If not in jar, check response directly
+	if !hasSessionCookie {
+		for _, c := range joinResp.Cookies() {
+			if c.Name == "session" && c.Value == data.SessionID {
+				hasSessionCookie = true
+				break
+			}
+		}
 	}
 
-	return Config{SessionID: actualSessionID, Password: hashedPassword}, nil
+	if !hasSessionCookie {
+		// Try to parse error response
+		var joinResult struct {
+			Success bool   `json:"success"`
+			Error   string `json:"error"`
+		}
+		if err := json.NewDecoder(joinResp.Body).Decode(&joinResult); err == nil && !joinResult.Success {
+			if joinResult.Error == "invalid_auth_key" || joinResult.Error == "auth_key_required" {
+				return GetSessionResponseBody{}, errors.New("invalid password")
+			}
+			return GetSessionResponseBody{}, fmt.Errorf("failed to join session: %s", joinResult.Error)
+		}
+		return GetSessionResponseBody{}, errors.New("failed to join session: no session cookie received")
+	}
+
+	// Extract session_token from jar
+	var sessionToken string
+	for _, c := range cookies {
+		if c.Name == "session_token" {
+			sessionToken = c.Value
+			break
+		}
+	}
+
+	return GetSessionResponseBody{
+		SessionID:       data.SessionID,
+		HasPassword:     checkData.HasPassword,
+		IsValidPassword: true,
+		CreatedAt:       checkData.CreatedAt,
+		SessionToken:    sessionToken,
+	}, nil
 }
 
-func joinSession(data Config) (GetSessionResponseBody, error) {
-	apiURL := fmt.Sprintf(utils.API_LINK+utils.API_PATH_SESSION+"?sessionId=%s&password=%s", data.SessionID, data.Password)
-
-	request, err := http.NewRequest("GET", apiURL, nil)
-
-	if err != nil {
-		return GetSessionResponseBody{}, err
-	}
-
-	request.Header.Add(utils.HEADER_CONTENT_TYPE, utils.CONTENT_TYPE_FORM)
-	response, err := client.Do(request)
-
-	if err != nil {
-		return GetSessionResponseBody{}, err
-	}
-
-	defer response.Body.Close()
-	var sessionCookieData GetSessionResponseBody
-	if err := json.NewDecoder(response.Body).Decode(&sessionCookieData); err != nil {
-		return GetSessionResponseBody{}, errors.New("error parsing server response")
-	}
-
-	if sessionCookieData.CreateNewSession || !sessionCookieData.IsValidPassword {
-		return GetSessionResponseBody{}, errors.New("invalid sessionId or password")
-	}
-
-	return sessionCookieData, nil
-}
-
-func createNote(data Config, note string) (*http.Response, error) {
+func createNote(note string) (*http.Response, error) {
 	apiURL := utils.API_LINK + utils.API_PATH_NOTE
-	body := []byte(`{
-		"content":"` + note + `"
-	}`)
+	body := []byte(`{"content":"` + note + `"}`)
 
 	r, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(body))
 	if err != nil {
@@ -240,15 +347,6 @@ func createNote(data Config, note string) (*http.Response, error) {
 	}
 
 	r.Header.Set("Content-Type", "application/json")
-
-	cookies := []*http.Cookie{
-		{Name: "session", Value: data.SessionID},
-		{Name: "password", Value: data.Password},
-	}
-
-	for _, cookie := range cookies {
-		r.AddCookie(cookie)
-	}
 
 	response, err := client.Do(r)
 	if err != nil {
@@ -258,7 +356,7 @@ func createNote(data Config, note string) (*http.Response, error) {
 	return response, nil
 }
 
-func uploadFile(data Config, filePath string) (*http.Response, error) {
+func uploadFile(filePath string) (*http.Response, error) {
 	apiURL := "https://copyman.fr/api/content/upload"
 
 	file, err := os.Open(filePath)
@@ -289,31 +387,15 @@ func uploadFile(data Config, filePath string) (*http.Response, error) {
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	cookies := []*http.Cookie{
-		{Name: "session", Value: data.SessionID},
-		{Name: "password", Value: data.Password},
-	}
-	for _, c := range cookies {
-		req.AddCookie(c)
-	}
-
 	return client.Do(req)
 }
 
-func getSessionContent(data Config) ([]ContentType, error) {
+func getSessionContent() ([]ContentType, error) {
 	apiURL := utils.API_LINK + utils.API_PATH_CONTENT
 
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return nil, err
-	}
-
-	cookies := []*http.Cookie{
-		{Name: "session", Value: data.SessionID},
-		{Name: "password", Value: data.Password},
-	}
-	for _, cookie := range cookies {
-		req.AddCookie(cookie)
 	}
 
 	resp, err := client.Do(req)
@@ -366,8 +448,8 @@ func getSessionContent(data Config) ([]ContentType, error) {
 	return results, nil
 }
 
-func getContentByID(data Config, contentID string) (ContentType, error) {
-	contents, err := getSessionContent(data)
+func getContentByID(contentID string) (ContentType, error) {
+	contents, err := getSessionContent()
 	if err != nil {
 		return nil, err
 	}
@@ -381,20 +463,12 @@ func getContentByID(data Config, contentID string) (ContentType, error) {
 	return nil, errors.New("content not found")
 }
 
-func deleteContent(data Config, contentID string) error {
+func deleteContent(contentID string) error {
 	apiURL := utils.API_LINK + utils.API_PATH_CONTENT + "?contentId=" + contentID
 
 	req, err := http.NewRequest("DELETE", apiURL, nil)
 	if err != nil {
 		return err
-	}
-
-	cookies := []*http.Cookie{
-		{Name: "session", Value: data.SessionID},
-		{Name: "password", Value: data.Password},
-	}
-	for _, cookie := range cookies {
-		req.AddCookie(cookie)
 	}
 
 	resp, err := client.Do(req)
@@ -411,8 +485,8 @@ func deleteContent(data Config, contentID string) error {
 	return nil
 }
 
-func downloadFile(data Config, contentID string, outputPath string) error {
-	content, err := getContentByID(data, contentID)
+func downloadFile(contentID string, outputPath string) error {
+	content, err := getContentByID(contentID)
 	if err != nil {
 		return err
 	}
@@ -427,14 +501,6 @@ func downloadFile(data Config, contentID string, outputPath string) error {
 	req, err := http.NewRequest("GET", downloadURL, nil)
 	if err != nil {
 		return err
-	}
-
-	cookies := []*http.Cookie{
-		{Name: "session", Value: data.SessionID},
-		{Name: "password", Value: data.Password},
-	}
-	for _, cookie := range cookies {
-		req.AddCookie(cookie)
 	}
 
 	resp, err := client.Do(req)
@@ -550,6 +616,38 @@ func writeConfig(config Config) error {
 	return nil
 }
 
+func loadCookiesToJar(config Config) {
+	if config.SessionID == "" {
+		return
+	}
+
+	// Create cookies for the API domain
+	apiURL, _ := url.Parse(utils.API_LINK)
+	cookies := []*http.Cookie{}
+
+	// Add session cookie
+	cookies = append(cookies, &http.Cookie{
+		Name:     "session",
+		Value:    config.SessionID,
+		Path:     "/",
+		Domain:   apiURL.Hostname(),
+		HttpOnly: false,
+	})
+
+	// Add session_token if available
+	if config.SessionToken != "" {
+		cookies = append(cookies, &http.Cookie{
+			Name:     "session_token",
+			Value:    config.SessionToken,
+			Path:     "/",
+			Domain:   apiURL.Hostname(),
+			HttpOnly: true,
+		})
+	}
+
+	jar.SetCookies(apiURL, cookies)
+}
+
 func getConfig() (Config, error) {
 	path, err := getConfigPath()
 
@@ -573,8 +671,10 @@ func getConfig() (Config, error) {
 		switch keyVal.Key {
 		case "SessionID":
 			config.SessionID = keyVal.Value
-		case "Password":
-			config.Password = keyVal.Value
+		case "SessionToken":
+			config.SessionToken = keyVal.Value
+		case "CreatedAt":
+			config.CreatedAt = keyVal.Value
 		}
 	}
 
@@ -618,6 +718,7 @@ Commands:
   
   get       Get content by ID
             copyman get <content-id> [--output /path]
+            copyman get -i              # Interactive mode with arrow key selection
   
   delete    Delete content by ID
             copyman delete <content-id>
@@ -628,6 +729,7 @@ Options:
   --temp          Create a temporary session (auto-expires)
   --json          Output in JSON format
   --output        Output file path for downloads
+  -i              Interactive mode (for get command)
   --help, -h      Show help`)
 }
 
@@ -722,14 +824,15 @@ func runLogin(args []string) error {
 		return errors.New("login requires --session-id")
 	}
 
-	joinedSession, err := joinSession(Config{SessionID: *sessionID, Password: *password})
+	joinedSession, err := joinSession(Config{SessionID: *sessionID}, *password)
 	if err != nil {
 		return fmt.Errorf("cannot join session: %w", err)
 	}
 
 	err = writeConfig(Config{
-		SessionID: joinedSession.SessionID,
-		Password:  joinedSession.Password,
+		SessionID:    joinedSession.SessionID,
+		CreatedAt:    joinedSession.CreatedAt,
+		SessionToken: joinedSession.SessionToken,
 	})
 
 	if err != nil {
@@ -751,9 +854,23 @@ func runLogout() error {
 		return nil
 	}
 
+	// Call server logout endpoint to clear session token
+	logoutURL := utils.API_LINK + utils.API_PATH_SESSION
+	req, err := http.NewRequest("DELETE", logoutURL, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+
 	err = writeConfig(Config{
-		SessionID: "",
-		Password:  "",
+		SessionID:    "",
+		SessionToken: "",
+		CreatedAt:    "",
 	})
 	if err != nil {
 		return err
@@ -773,6 +890,9 @@ func runPush(args []string) error {
 		return errors.New("not logged in. Run 'copyman login' first")
 	}
 
+	// Load cookies from config into jar
+	loadCookiesToJar(config)
+
 	if len(args) < 2 {
 		return errors.New("push requires subcommand: 'text' or 'file'")
 	}
@@ -786,7 +906,7 @@ func runPush(args []string) error {
 			return errors.New("push text requires content argument")
 		}
 		text := strings.Join(remainingArgs, " ")
-		resp, err := createNote(config, text)
+		resp, err := createNote(text)
 		if err != nil {
 			return fmt.Errorf("error creating note: %w", err)
 		}
@@ -802,7 +922,7 @@ func runPush(args []string) error {
 			return errors.New("push file requires file path argument")
 		}
 		for _, filePath := range remainingArgs {
-			resp, err := uploadFile(config, filePath)
+			resp, err := uploadFile(filePath)
 			if err != nil {
 				return fmt.Errorf("error uploading file %s: %w", filePath, err)
 			}
@@ -831,11 +951,14 @@ func runList(args []string) error {
 		return errors.New("not logged in. Run 'copyman login' first")
 	}
 
+	// Load cookies from config into jar
+	loadCookiesToJar(config)
+
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	jsonOutput := fs.Bool("json", false, "Output in JSON format")
 	fs.Parse(args)
 
-	contents, err := getSessionContent(config)
+	contents, err := getSessionContent()
 	if err != nil {
 		return fmt.Errorf("error getting session content: %w", err)
 	}
@@ -870,30 +993,89 @@ func runGet(args []string) error {
 		return errors.New("not logged in. Run 'copyman login' first")
 	}
 
+	// Load cookies from config into jar
+	loadCookiesToJar(config)
+
 	fs := flag.NewFlagSet("get", flag.ExitOnError)
 	output := fs.String("output", "", "Output file path for downloads")
+	interactive := fs.Bool("i", false, "Interactive mode - select from list with arrow keys")
 	fs.Parse(args)
 
 	remaining := fs.Args()
-	if len(remaining) == 0 {
-		return errors.New("get requires content-id argument")
+
+	var contentID string
+	var selectedContent ContentType
+
+	if *interactive || len(remaining) == 0 {
+		// Interactive mode - show selectable list
+		contents, err := getSessionContent()
+		if err != nil {
+			return fmt.Errorf("error getting session content: %w", err)
+		}
+
+		if len(contents) == 0 {
+			return errors.New("no content available in session")
+		}
+
+		// Prepare items for selection
+		items := make([]string, len(contents))
+		for i, content := range contents {
+			switch c := content.(type) {
+			case NoteType:
+				items[i] = fmt.Sprintf("[TEXT] %s | %s", c.ID, truncate(c.Content, 40))
+			case AttachmentType:
+				items[i] = fmt.Sprintf("[FILE] %s | %s", c.ID, c.AttachmentPath)
+			}
+		}
+
+		// Create prompt for selection
+		prompt := promptui.Select{
+			Label: "Select content to download",
+			Items: items,
+			Size:  10,
+		}
+
+		index, _, err := prompt.Run()
+		if err != nil {
+			return fmt.Errorf("selection cancelled: %w", err)
+		}
+
+		selectedContent = contents[index]
+		contentID = selectedContent.GetID()
+
+		// For attachments, prompt for custom filename
+		if attachment, ok := selectedContent.(AttachmentType); ok {
+			filenamePrompt := promptui.Prompt{
+				Label:   "Enter filename",
+				Default: attachment.AttachmentPath,
+			}
+
+			customName, err := filenamePrompt.Run()
+			if err != nil {
+				return fmt.Errorf("filename prompt cancelled: %w", err)
+			}
+
+			if customName != "" {
+				*output = customName
+			}
+		}
+	} else {
+		contentID = remaining[0]
+		content, err := getContentByID(contentID)
+		if err != nil {
+			return fmt.Errorf("error getting content: %w", err)
+		}
+		selectedContent = content
 	}
 
-	contentID := remaining[0]
-
-	content, err := getContentByID(config, contentID)
-	if err != nil {
-		return fmt.Errorf("error getting content: %w", err)
-	}
-
-	switch c := content.(type) {
+	switch c := selectedContent.(type) {
 	case NoteType:
 		fmt.Println(c.Content)
 	case AttachmentType:
 		if *output == "" {
 			*output = c.AttachmentPath
 		}
-		err := downloadFile(config, contentID, *output)
+		err := downloadFile(contentID, *output)
 		if err != nil {
 			return fmt.Errorf("error downloading file: %w", err)
 		}
@@ -913,13 +1095,16 @@ func runDelete(args []string) error {
 		return errors.New("not logged in. Run 'copyman login' first")
 	}
 
+	// Load cookies from config into jar
+	loadCookiesToJar(config)
+
 	if len(args) == 0 {
 		return errors.New("delete requires content-id argument")
 	}
 
 	contentID := args[0]
 
-	err = deleteContent(config, contentID)
+	err = deleteContent(contentID)
 	if err != nil {
 		return fmt.Errorf("error deleting content: %w", err)
 	}
