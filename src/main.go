@@ -2,13 +2,13 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"math/rand"
-	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -63,6 +63,7 @@ type Config struct {
 	SessionID    string
 	SessionToken string
 	CreatedAt    string
+	EncKey       string // Hex-encoded encryption key (derived from password)
 }
 
 type BaseContentType struct {
@@ -74,7 +75,10 @@ type BaseContentType struct {
 
 type NoteType struct {
 	BaseContentType
-	Content string `json:"content"`
+	Content       string `json:"content"`
+	IsEncrypted   bool   `json:"isEncrypted,omitempty"`
+	EncryptedIv   string `json:"encryptedIv,omitempty"`
+	EncryptedSalt string `json:"encryptedSalt,omitempty"`
 }
 
 type AttachmentType struct {
@@ -82,6 +86,9 @@ type AttachmentType struct {
 	AttachmentURL  string `json:"attachmentURL"`
 	AttachmentPath string `json:"attachmentPath"`
 	FileKey        string `json:"fileKey"`
+	IsEncrypted    bool   `json:"isEncrypted,omitempty"`
+	EncryptedIv    string `json:"encryptedIv,omitempty"`
+	EncryptedSalt  string `json:"encryptedSalt,omitempty"`
 }
 
 type ContentOutput struct {
@@ -337,11 +344,35 @@ func joinSession(data Config, password string) (GetSessionResponseBody, error) {
 	}, nil
 }
 
-func createNote(note string) (*http.Response, error) {
+func createNote(note string, encKey []byte) (*http.Response, error) {
 	apiURL := utils.API_LINK + utils.API_PATH_NOTE
-	body := []byte(`{"content":"` + note + `"}`)
 
-	r, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(body))
+	var requestBody map[string]interface{}
+
+	if encKey != nil {
+		// Encrypt the note
+		encData, err := encryptString(note, encKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encrypt note: %w", err)
+		}
+		requestBody = map[string]interface{}{
+			"content":       encData.Ciphertext,
+			"isEncrypted":   true,
+			"encryptedIv":   encData.IV,
+			"encryptedSalt": encData.Salt,
+		}
+	} else {
+		requestBody = map[string]interface{}{
+			"content": note,
+		}
+	}
+
+	jsonBody, err := json.Marshal(requestBody)
+	if err != nil {
+		return nil, err
+	}
+
+	r, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, err
 	}
@@ -356,38 +387,135 @@ func createNote(note string) (*http.Response, error) {
 	return response, nil
 }
 
-func uploadFile(filePath string) (*http.Response, error) {
-	apiURL := "https://copyman.fr/api/content/upload"
+func uploadFile(filePath string, encKey []byte) (*http.Response, error) {
+	// Step 1: Get file info
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat file: %w", err)
+	}
 
-	file, err := os.Open(filePath)
+	// Step 2: Get presigned URLs for upload
+	presignURL := utils.API_LINK + utils.API_PATH_UPLOAD + "/presign"
+	presignBody := map[string]interface{}{
+		"files": []map[string]interface{}{
+			{
+				"name": filepath.Base(filePath),
+				"type": "application/octet-stream",
+				"size": fileInfo.Size(),
+			},
+		},
+	}
+
+	jsonBody, err := json.Marshal(presignBody)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
+	req, err := http.NewRequest("POST", presignURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
 
-	part, err := writer.CreateFormFile("files", filepath.Base(filePath))
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to get presigned URL: %s", string(body))
+	}
+
+	var presignData struct {
+		Presigned []struct {
+			UploadURL string            `json:"uploadUrl"`
+			FileKey   string            `json:"fileKey"`
+			Headers   map[string]string `json:"headers"`
+		} `json:"presigned"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&presignData); err != nil {
+		return nil, fmt.Errorf("failed to parse presign response: %w", err)
+	}
+
+	if len(presignData.Presigned) == 0 {
+		return nil, errors.New("no presigned URL returned")
+	}
+
+	// Step 3: Read and optionally encrypt file
+	fileData, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+
+	var encryptedData *EncryptedData
+	uploadData := fileData
+
+	if encKey != nil {
+		// Encrypt file
+		encryptedData, err = encryptFile(fileData, encKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encrypt file: %w", err)
+		}
+		// Decode base64 ciphertext to get raw bytes for upload
+		uploadData, err = base64.StdEncoding.DecodeString(encryptedData.Ciphertext)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode encrypted data: %w", err)
+		}
+	}
+
+	// Step 4: Upload to R2
+	uploadReq, err := http.NewRequest("PUT", presignData.Presigned[0].UploadURL, bytes.NewReader(uploadData))
 	if err != nil {
 		return nil, err
 	}
 
-	if _, err = io.Copy(part, file); err != nil {
-		return nil, err
+	// Add headers from presign response (required for signature validation)
+	for key, value := range presignData.Presigned[0].Headers {
+		uploadReq.Header.Set(key, value)
 	}
 
-	if err = writer.Close(); err != nil {
-		return nil, err
+	uploadResp, err := client.Do(uploadReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to upload file: %w", err)
+	}
+	defer uploadResp.Body.Close()
+
+	if uploadResp.StatusCode != 200 {
+		body, _ := io.ReadAll(uploadResp.Body)
+		return nil, fmt.Errorf("upload failed: %s", string(body))
 	}
 
-	req, err := http.NewRequest("POST", apiURL, &buf)
+	// Step 5: Finalize upload
+	finalizeURL := utils.API_LINK + utils.API_PATH_UPLOAD_FINALIZE
+	finalizeBody := map[string]interface{}{
+		"files": []map[string]interface{}{
+			{
+				"fileKey":  presignData.Presigned[0].FileKey,
+				"fileName": filepath.Base(filePath),
+			},
+		},
+	}
+
+	if encKey != nil && encryptedData != nil {
+		finalizeBody["files"].([]map[string]interface{})[0]["isEncrypted"] = true
+		finalizeBody["files"].([]map[string]interface{})[0]["encryptedIv"] = encryptedData.IV
+		finalizeBody["files"].([]map[string]interface{})[0]["encryptedSalt"] = encryptedData.Salt
+	}
+
+	jsonBody, err = json.Marshal(finalizeBody)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	return client.Do(req)
+	finalizeReq, err := http.NewRequest("POST", finalizeURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return nil, err
+	}
+	finalizeReq.Header.Set("Content-Type", "application/json")
+
+	return client.Do(finalizeReq)
 }
 
 func getSessionContent() ([]ContentType, error) {
@@ -448,6 +576,151 @@ func getSessionContent() ([]ContentType, error) {
 	return results, nil
 }
 
+func getSessionStatus() (*SessionCheckResponse, error) {
+	config, err := getConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	apiURL := fmt.Sprintf("%s%s?sessionId=%s", utils.API_LINK, utils.API_PATH_SESSION, config.SessionID)
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("failed to get session status: %d", resp.StatusCode)
+	}
+
+	var status SessionCheckResponse
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return nil, fmt.Errorf("failed to parse session status: %w", err)
+	}
+
+	return &status, nil
+}
+
+func enableEncryption(password string) error {
+	config, err := getConfig()
+	if err != nil {
+		return err
+	}
+
+	// Load cookies from config into jar
+	loadCookiesToJar(config)
+
+	// First, verify password
+	status, err := getSessionStatus()
+	if err != nil {
+		return err
+	}
+
+	if !status.HasPassword {
+		return errors.New("session must have a password to enable E2EE")
+	}
+
+	// Derive auth key and verify password
+	authKey := deriveAuthKey(password, config.CreatedAt)
+	verifyURL := fmt.Sprintf("%s%s/verify-password?sessionId=%s", utils.API_LINK, utils.API_PATH_SESSION, config.SessionID)
+	verifyBody := map[string]string{"authKey": authKey}
+	jsonBody, _ := json.Marshal(verifyBody)
+
+	req, err := http.NewRequest("POST", verifyURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var verifyResult struct {
+		Valid bool `json:"valid"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&verifyResult); err != nil {
+		return fmt.Errorf("failed to parse verification: %w", err)
+	}
+
+	if !verifyResult.Valid {
+		return errors.New("invalid password")
+	}
+
+	// Enable encryption on server
+	encURL := utils.API_LINK + "/sessions/encryption"
+	encBody := map[string]bool{"isEncrypted": true}
+	jsonBody, _ = json.Marshal(encBody)
+
+	req, err = http.NewRequest("POST", encURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to enable encryption: %s", string(body))
+	}
+
+	// Store encryption key locally
+	encKey := deriveEncKey(password, config.CreatedAt)
+	config.EncKey = bytesToHex(encKey)
+	return writeConfig(config)
+}
+
+func disableEncryption() error {
+	config, err := getConfig()
+	if err != nil {
+		return err
+	}
+
+	// Load cookies from config into jar
+	loadCookiesToJar(config)
+
+	encURL := utils.API_LINK + "/sessions/encryption"
+	encBody := map[string]bool{"isEncrypted": false}
+	jsonBody, _ := json.Marshal(encBody)
+
+	req, err := http.NewRequest("POST", encURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to disable encryption: %s", string(body))
+	}
+
+	// Remove encryption key from config
+	config, err = getConfig()
+	if err != nil {
+		return err
+	}
+	config.EncKey = ""
+	return writeConfig(config)
+}
+
 func getContentByID(contentID string) (ContentType, error) {
 	contents, err := getSessionContent()
 	if err != nil {
@@ -485,13 +758,13 @@ func deleteContent(contentID string) error {
 	return nil
 }
 
-func downloadFile(contentID string, outputPath string) error {
+func downloadFile(contentID string, outputPath string, encKey []byte) error {
 	content, err := getContentByID(contentID)
 	if err != nil {
 		return err
 	}
 
-	_, ok := content.(AttachmentType)
+	attachment, ok := content.(AttachmentType)
 	if !ok {
 		return errors.New("content is not a file")
 	}
@@ -513,13 +786,35 @@ func downloadFile(contentID string, outputPath string) error {
 		return fmt.Errorf("download failed with status: %d", resp.StatusCode)
 	}
 
+	// Read downloaded data
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read download data: %w", err)
+	}
+
+	// Decrypt if file is encrypted and we have the key
+	if attachment.IsEncrypted {
+		if encKey == nil {
+			return errors.New("file is encrypted but no encryption key available - login with password to decrypt")
+		}
+		encData := &EncryptedData{
+			Ciphertext: base64.StdEncoding.EncodeToString(data),
+			IV:         attachment.EncryptedIv,
+			Salt:       attachment.EncryptedSalt,
+		}
+		data, err = decryptFile(encData, encKey)
+		if err != nil {
+			return fmt.Errorf("failed to decrypt file: %w", err)
+		}
+	}
+
 	out, err := os.Create(outputPath)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, resp.Body)
+	_, err = out.Write(data)
 	return err
 }
 
@@ -675,6 +970,8 @@ func getConfig() (Config, error) {
 			config.SessionToken = keyVal.Value
 		case "CreatedAt":
 			config.CreatedAt = keyVal.Value
+		case "EncKey":
+			config.EncKey = keyVal.Value
 		}
 	}
 
@@ -722,6 +1019,13 @@ Commands:
   
   delete    Delete content by ID
             copyman delete <content-id>
+
+  status    Show session status and E2EE info
+            copyman status
+
+  encryption Manage E2EE encryption
+            copyman encryption enable --password <pass>
+            copyman encryption disable
 
 Options:
   --session-id    Session ID (custom or to join)
@@ -799,6 +1103,13 @@ func runCreate(args []string) error {
 	}
 	if *password != "" {
 		fmt.Printf("Password: %s\n", *password)
+		// Derive encryption key from password
+		encKey := deriveEncKey(*password, config.CreatedAt)
+		config.EncKey = bytesToHex(encKey)
+		err = writeConfig(config)
+		if err != nil {
+			return fmt.Errorf("cannot write encryption key to config: %w", err)
+		}
 	}
 	fmt.Println("\nShare this session ID with others to collaborate!")
 	return nil
@@ -829,12 +1140,19 @@ func runLogin(args []string) error {
 		return fmt.Errorf("cannot join session: %w", err)
 	}
 
-	err = writeConfig(Config{
+	config := Config{
 		SessionID:    joinedSession.SessionID,
 		CreatedAt:    joinedSession.CreatedAt,
 		SessionToken: joinedSession.SessionToken,
-	})
+	}
 
+	// Derive encryption key from password if provided
+	if *password != "" {
+		encKey := deriveEncKey(*password, joinedSession.CreatedAt)
+		config.EncKey = bytesToHex(encKey)
+	}
+
+	err = writeConfig(config)
 	if err != nil {
 		return fmt.Errorf("cannot write to config file: %w", err)
 	}
@@ -893,6 +1211,21 @@ func runPush(args []string) error {
 	// Load cookies from config into jar
 	loadCookiesToJar(config)
 
+	// Check if session has E2EE enabled
+	var encKey []byte
+	status, err := getSessionStatus()
+	if err != nil {
+		return fmt.Errorf("failed to get session status: %w", err)
+	}
+
+	// Only use encryption key if session has E2EE enabled
+	if status.IsEncrypted && config.EncKey != "" {
+		encKey, err = hexToBytes(config.EncKey)
+		if err != nil {
+			return fmt.Errorf("invalid encryption key in config: %w", err)
+		}
+	}
+
 	if len(args) < 2 {
 		return errors.New("push requires subcommand: 'text' or 'file'")
 	}
@@ -906,7 +1239,7 @@ func runPush(args []string) error {
 			return errors.New("push text requires content argument")
 		}
 		text := strings.Join(remainingArgs, " ")
-		resp, err := createNote(text)
+		resp, err := createNote(text, encKey)
 		if err != nil {
 			return fmt.Errorf("error creating note: %w", err)
 		}
@@ -922,7 +1255,7 @@ func runPush(args []string) error {
 			return errors.New("push file requires file path argument")
 		}
 		for _, filePath := range remainingArgs {
-			resp, err := uploadFile(filePath)
+			resp, err := uploadFile(filePath, encKey)
 			if err != nil {
 				return fmt.Errorf("error uploading file %s: %w", filePath, err)
 			}
@@ -974,9 +1307,17 @@ func runList(args []string) error {
 	for _, content := range contents {
 		switch c := content.(type) {
 		case NoteType:
-			fmt.Printf("[TEXT] %s | %s\n", c.ID, truncate(c.Content, 50))
+			encIndicator := ""
+			if c.IsEncrypted {
+				encIndicator = " [ENCRYPTED]"
+			}
+			fmt.Printf("[TEXT]%s %s | %s\n", encIndicator, c.ID, truncate(c.Content, 50))
 		case AttachmentType:
-			fmt.Printf("[FILE] %s | %s\n", c.ID, c.AttachmentPath)
+			encIndicator := ""
+			if c.IsEncrypted {
+				encIndicator = " [ENCRYPTED]"
+			}
+			fmt.Printf("[FILE]%s %s | %s\n", encIndicator, c.ID, c.AttachmentPath)
 		}
 	}
 
@@ -995,6 +1336,21 @@ func runGet(args []string) error {
 
 	// Load cookies from config into jar
 	loadCookiesToJar(config)
+
+	// Check if session has E2EE enabled
+	var encKey []byte
+	status, err := getSessionStatus()
+	if err != nil {
+		return fmt.Errorf("failed to get session status: %w", err)
+	}
+
+	// Only use encryption key if session has E2EE enabled
+	if status.IsEncrypted && config.EncKey != "" {
+		encKey, err = hexToBytes(config.EncKey)
+		if err != nil {
+			return fmt.Errorf("invalid encryption key in config: %w", err)
+		}
+	}
 
 	fs := flag.NewFlagSet("get", flag.ExitOnError)
 	output := fs.String("output", "", "Output file path for downloads")
@@ -1070,12 +1426,28 @@ func runGet(args []string) error {
 
 	switch c := selectedContent.(type) {
 	case NoteType:
-		fmt.Println(c.Content)
+		if c.IsEncrypted {
+			if encKey == nil {
+				return errors.New("note is encrypted but no encryption key available - login with password to decrypt")
+			}
+			encData := &EncryptedData{
+				Ciphertext: c.Content,
+				IV:         c.EncryptedIv,
+				Salt:       c.EncryptedSalt,
+			}
+			decrypted, err := decryptString(encData, encKey)
+			if err != nil {
+				return fmt.Errorf("failed to decrypt note: %w", err)
+			}
+			fmt.Println(decrypted)
+		} else {
+			fmt.Println(c.Content)
+		}
 	case AttachmentType:
 		if *output == "" {
 			*output = c.AttachmentPath
 		}
-		err := downloadFile(contentID, *output)
+		err := downloadFile(contentID, *output, encKey)
 		if err != nil {
 			return fmt.Errorf("error downloading file: %w", err)
 		}
@@ -1143,6 +1515,10 @@ func main() {
 		err = runGet(args)
 	case "delete":
 		err = runDelete(args)
+	case "status":
+		err = runStatus()
+	case "encryption":
+		err = runEncryption(args)
 	case "help", "-h", "--help":
 		printHelp()
 	default:
@@ -1155,4 +1531,79 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func runStatus() error {
+	config, err := getConfig()
+	if err != nil {
+		return fmt.Errorf("cannot get config: %w", err)
+	}
+
+	if config.SessionID == "" {
+		return errors.New("not logged in. Run 'copyman login' first")
+	}
+
+	status, err := getSessionStatus()
+	if err != nil {
+		return fmt.Errorf("failed to get session status: %w", err)
+	}
+
+	hasEncKey := config.EncKey != ""
+
+	fmt.Printf("Session ID: %s\n", config.SessionID)
+	fmt.Printf("Has Password: %t\n", status.HasPassword)
+	fmt.Printf("E2EE Enabled: %t\n", status.IsEncrypted)
+	fmt.Printf("Encryption Key Available: %t\n", hasEncKey)
+	fmt.Printf("Created At: %s\n", status.CreatedAt)
+
+	if status.HasPassword && !status.IsEncrypted {
+		fmt.Println("\nNote: Session has password but E2EE is not enabled.")
+		fmt.Println("Run 'copyman encryption enable' to enable E2EE.")
+	}
+
+	if status.IsEncrypted && !hasEncKey {
+		fmt.Println("\nWarning: Session has E2EE enabled but no encryption key.")
+		fmt.Println("Login with password to derive the encryption key.")
+	}
+
+	return nil
+}
+
+func runEncryption(args []string) error {
+	if len(args) == 0 {
+		return errors.New("encryption requires subcommand: 'enable' or 'disable'")
+	}
+
+	subCommand := args[0]
+
+	switch subCommand {
+	case "enable":
+		fs := flag.NewFlagSet("encryption enable", flag.ExitOnError)
+		password := fs.String("password", "", "Session password (required)")
+		fs.Parse(args[1:])
+
+		if *password == "" {
+			return errors.New("--password is required to enable E2EE")
+		}
+
+		fmt.Println("Enabling E2EE encryption...")
+		if err := enableEncryption(*password); err != nil {
+			return fmt.Errorf("failed to enable encryption: %w", err)
+		}
+		fmt.Println("E2EE encryption enabled successfully!")
+		fmt.Println("Future content will be encrypted before upload.")
+
+	case "disable":
+		fmt.Println("Disabling E2EE encryption...")
+		if err := disableEncryption(); err != nil {
+			return fmt.Errorf("failed to disable encryption: %w", err)
+		}
+		fmt.Println("E2EE encryption disabled.")
+		fmt.Println("Note: Previously encrypted content remains encrypted.")
+
+	default:
+		return fmt.Errorf("unknown encryption subcommand: %s (use 'enable' or 'disable')", subCommand)
+	}
+
+	return nil
 }
