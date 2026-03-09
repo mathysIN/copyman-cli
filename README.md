@@ -132,7 +132,7 @@ copyman delete <content-id>
 
 ### End-to-End Encryption
 
-E2EE is optional and separate from session passwords:
+E2EE is optional and the following flow :
 
 ```bash
 # 1. Create session with password (access control)
@@ -149,8 +149,8 @@ copyman get <content-id>
 ```
 
 **Note:**
-- Password = Access control (who can join)
-- E2EE = Content encryption (must be enabled separately)
+- Current session password = password used for E2EE
+- Content encrypted with different passwords can co-exist on the session
 - Mixed content: Some encrypted, some not - all works fine
 - Encrypted content shows `[ENCRYPTED]` in list view
 
